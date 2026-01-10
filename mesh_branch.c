@@ -14,6 +14,13 @@
 #include "driver/i2c_master.h"
 #include "ssd1306.h"
 
+#include "lwip/sockets.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+
+#define RECEIVER_IP "192.168.4.2" 
+#define RECEIVER_PORT 5005
+
 #define MESH_ID        {0x11, 0x22, 0x33, 0x44, 0x55, 0x66}
 #define MESH_CHANNEL   6
 
@@ -51,6 +58,31 @@ static void oled_init(void)
     ssd1306_display_text(g_oled, 0, "Mesh receiver", false);
 }
 
+static void forward_to_udp(const sensor_payload_t *payload) {
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr(RECEIVER_IP);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(RECEIVER_PORT);
+
+    // Create socket
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        return;
+    }
+
+    // Send the struct directly
+    int err = sendto(sock, payload, sizeof(sensor_payload_t), 0, 
+                     (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
+    if (err < 0) {
+        ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+    } else {
+        ESP_LOGI(TAG, "UDP packet sent to %s", RECEIVER_IP);
+    }
+
+    close(sock);
+}
 
 static void oled_show_sensor(const sensor_payload_t *p)
 {
@@ -74,65 +106,86 @@ static void oled_show_sensor(const sensor_payload_t *p)
     ssd1306_display_text(g_oled, 4, line3, false);
 }
 
+static bool s_has_ip = false;
+
 static void mesh_event_handler(void *arg, esp_event_base_t base, int32_t id, void *event_data)
 {
-    switch (id) {
-        case MESH_EVENT_STARTED:
-            ESP_LOGI(TAG, "MESH started");
-            break;
-        case MESH_EVENT_PARENT_CONNECTED:
-            ESP_LOGI(TAG, "Parent connected");
-            break;
-        case MESH_EVENT_CHILD_CONNECTED:
-            ESP_LOGI(TAG, "Child connected");
-            break;
-        case MESH_EVENT_CHILD_DISCONNECTED:
-            ESP_LOGI(TAG, "Child disconnected");
-            break;
-        default:
-            break;
+    if (base == MESH_EVENT) {
+        switch (id) {
+            case MESH_EVENT_STARTED:
+                ESP_LOGI(TAG, "MESH started");
+                break;
+            case MESH_EVENT_PARENT_CONNECTED:
+                ESP_LOGI(TAG, "Connected to Router (Parent)");
+                break;
+            case MESH_EVENT_CHILD_CONNECTED:
+                ESP_LOGI(TAG, "Child node connected to this Root");
+                break;
+            // Removed MESH_EVENT_ROOT_GOT_IP as it's not in IDF v5.x
+            default:
+                break;
+        }
+    } 
+    // This is the block that actually matters for your UDP socket
+    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+        ESP_LOGI(TAG, "TCP/IP Layer: GOT IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_has_ip = true;
+    }
+    else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
+        ESP_LOGW(TAG, "TCP/IP Layer: LOST IP");
+        s_has_ip = false;
     }
 }
 
 static void wifi_mesh_init(void)
 {
-    //wifi init
+    // 1. Core Network Init
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // 2. Create the Station Interface (Necessary for Root to get IP)
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    assert(sta_netif);
+
+    // 3. Wi-Fi Driver Init
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    // Register handlers for both the Mesh and the IP stacks
+    ESP_ERROR_CHECK(esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID, &mesh_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &mesh_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &mesh_event_handler, NULL));
+
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    //mesh init
+    // 4. Mesh Stack Init
     ESP_ERROR_CHECK(esp_mesh_init());
-    esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID, &mesh_event_handler, NULL);
-
-     mesh_cfg_t mesh_config = MESH_INIT_CONFIG_DEFAULT();
+    
+    mesh_cfg_t mesh_config = MESH_INIT_CONFIG_DEFAULT();
+    
+    // Mesh Identity
     uint8_t mesh_id[6] = MESH_ID;
     memcpy(mesh_config.mesh_id.addr, mesh_id, 6);
-    mesh_config.channel = MESH_CHANNEL;
-
+    
+    // Credentials for the "Virtual Router" Access Point
     const char *router_ssid = "VirtualMeshRouter";
     const char *router_pass = "meshpass";
-    strncpy((char *)mesh_config.router.ssid, router_ssid, sizeof(mesh_config.router.ssid));
+    
+    mesh_config.channel = 6;
     mesh_config.router.ssid_len = strlen(router_ssid);
-    strncpy((char *)mesh_config.router.password, router_pass, sizeof(mesh_config.router.password));
-    mesh_config.channel = 6;  //router channel
+    memcpy(mesh_config.router.ssid, router_ssid, mesh_config.router.ssid_len);
+    memcpy(mesh_config.router.password, router_pass, strlen(router_pass));
 
-    //how many children can each node have
+    // Internal Mesh AP (for children)
     mesh_config.mesh_ap.max_connection = 6;
-    //set password for this nodes children
     strncpy((char *)mesh_config.mesh_ap.password, "meshpass", sizeof(mesh_config.mesh_ap.password));
 
-    //self organisation of network. 
     ESP_ERROR_CHECK(esp_mesh_set_self_organized(true, true));
-
-    //apply config
     ESP_ERROR_CHECK(esp_mesh_set_config(&mesh_config));
+    
     ESP_ERROR_CHECK(esp_mesh_start());
-
-    ESP_LOGI(TAG, "Mesh initialization complete (Router-less mode)");
-
 }
 
 
@@ -185,6 +238,8 @@ void app_main(void)
                 if (g_oled) {
                     oled_show_sensor(&p);
                 }
+
+                forward_to_udp(&p);
 
             } else {
                 //if i get something other than payload struct
