@@ -15,12 +15,14 @@
 
 static const char *TAG = "MESH_APP";
 
+//standard mesh sensor data type. 
 typedef struct __attribute__((packed)) {
     uint8_t  src_mac[6];    //MAC address of sender for after root
     int16_t  tilt_measurement;  //tiltmeaurement
     uint16_t moisture_measurement;  //moisture measurement
 } sensor_payload_t;
 
+//mesh handler helper, required for mesh operation
 static void mesh_event_handler(void *arg, esp_event_base_t base, int32_t id, void *event_data)
 {
     switch (id) {
@@ -41,6 +43,7 @@ static void mesh_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     }
 }
 
+//setup wifi network helper function.
 static void wifi_mesh_init(void)
 {
     //wifi init
@@ -77,12 +80,14 @@ static void wifi_mesh_init(void)
     ESP_LOGI(TAG, "Mesh initialization complete (Router-less mode)");
 }
 
+//main loop
 void app_main(void)
 {
+    //setup for mesh network, required to be here. Do not delete. 
     ESP_ERROR_CHECK(nvs_flash_init());
     wifi_mesh_init();
 
-    //gpio setup
+    //gpio setup for testing can delete
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << INPUT_GPIO),
         .mode = GPIO_MODE_INPUT,
@@ -90,15 +95,15 @@ void app_main(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE
     };
     gpio_config(&io_conf);
-
+    //mesh network setup, dont delete
     ESP_LOGI(TAG, "This node is the LEAF. Waiting for GPIO25 HIGH...");
 
     //sample message struct
     sensor_payload_t sensor_payload = {0};
-    //save mac for processing outside of mesh
+    //save mac for processing outside of mesh, required for ID'ing messages
     ESP_ERROR_CHECK(esp_read_mac(sensor_payload.src_mac, ESP_MAC_WIFI_STA)); 
 
-    //data setup
+    //data setup required for mesh operation
     mesh_data_t data = {0};
     data.data = (uint8_t*)&sensor_payload;
     data.size = sizeof(sensor_payload);
@@ -117,10 +122,10 @@ void app_main(void)
         int level = gpio_get_level(INPUT_GPIO);
 
         if (level == 1) {
-            //pin is high, send message
+            //how to send a message. 
             esp_err_t err = esp_mesh_send(NULL, &data, 0, NULL, 0);
 
-
+            //idebug print.n 
         if (err == ESP_OK) {
             ESP_LOGI(TAG,
                 "GPIO25 HIGH → Struct sent: tilt=%d, moisture=%u, mac=%02X:%02X:%02X:%02X:%02X:%02X",
